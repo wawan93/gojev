@@ -136,3 +136,16 @@ func TestSystemOneRequestBuilder(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildReturnsSnapshot(t *testing.T) {
+	b := gojev.NewSystemOneBuilder("state").Noul("a", "?")
+	r1 := b.Build()
+	b.Noul("b", "?").Model("m2")
+	r2 := b.Build()
+	if len(r1.Questions) != 1 || r1.Model != "" {
+		t.Errorf("earlier built request was mutated: %+v", r1)
+	}
+	if len(r2.Questions) != 2 || r2.Model != "m2" {
+		t.Errorf("unexpected second request: %+v", r2)
+	}
+}

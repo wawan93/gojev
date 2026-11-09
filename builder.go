@@ -2,6 +2,8 @@ package gojev
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"time"
 )
 
@@ -37,6 +39,34 @@ func (b *SystemOneRequestBuilder) Choice(name string, instructions JSONContent, 
 // Score adds a scoring question with ordered criteria.
 func (b *SystemOneRequestBuilder) Score(name string, instructions JSONContent, criteria []JSONContent) *SystemOneRequestBuilder {
 	b.req.Questions[name] = Score(instructions, criteria)
+	return b
+}
+
+// Box adds a box question. It requires Jev 1.14 and DangerZoneImages.
+func (b *SystemOneRequestBuilder) Box(name string, instructions JSONContent) *SystemOneRequestBuilder {
+	b.req.Questions[name] = Box(instructions)
+	return b
+}
+
+// Asset adds an image asset under a placeholder key referenced from the
+// state, instructions or criteria. It requires DangerZoneImages.
+func (b *SystemOneRequestBuilder) Asset(key string, asset Asset) *SystemOneRequestBuilder {
+	if b.req.Assets == nil {
+		b.req.Assets = make(map[string]Asset)
+	}
+	b.req.Assets[key] = asset
+	return b
+}
+
+// DangerZoneImages opts the request in to image assets and box questions.
+func (b *SystemOneRequestBuilder) DangerZoneImages() *SystemOneRequestBuilder {
+	b.opts = append(b.opts, WithDangerZoneImages())
+	return b
+}
+
+// DangerZoneLongContext opts the request in to the long-context limits.
+func (b *SystemOneRequestBuilder) DangerZoneLongContext() *SystemOneRequestBuilder {
+	b.opts = append(b.opts, WithDangerZoneLongContext())
 	return b
 }
 
@@ -84,14 +114,18 @@ func (b *SystemOneRequestBuilder) Retry(policy *RetryPolicy) *SystemOneRequestBu
 	return b
 }
 
-// Build returns the constructed SystemOneRequest.
+// Build returns a snapshot of the constructed SystemOneRequest. Later builder
+// calls do not modify requests that were already built.
 func (b *SystemOneRequestBuilder) Build() *SystemOneRequest {
-	return b.req
+	req := *b.req
+	req.Questions = maps.Clone(b.req.Questions)
+	req.Assets = maps.Clone(b.req.Assets)
+	return &req
 }
 
-// Options returns any request options configured on this builder.
+// Options returns a copy of the request options configured on this builder.
 func (b *SystemOneRequestBuilder) Options() []RequestOption {
-	return b.opts
+	return slices.Clone(b.opts)
 }
 
 // Do executes the request using the attached client.

@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,6 +22,17 @@ const (
 	DefaultBaseURL = "https://api.typesafe.ai"
 	// DefaultModel is the default model used for evaluation requests.
 	DefaultModel = "jev-latest"
+
+	// maxRetryAfter caps how long a server-provided Retry-After may delay a retry.
+	maxRetryAfter = 60.0 // seconds
+
+	// HeaderDangerZoneImages must be "true" for requests that use image assets or box questions.
+	HeaderDangerZoneImages = "TypeSafe-Danger-Zone-Images"
+	// HeaderDangerZoneLongContext set to "true" raises the model's context limits.
+	HeaderDangerZoneLongContext = "TypeSafe-Danger-Zone-Long-Context"
+
+	// maxDelaySeconds is the largest delay that fits in a time.Duration.
+	maxDelaySeconds = float64(math.MaxInt64 / int64(time.Second))
 )
 
 var (
@@ -72,10 +84,12 @@ func (c *Client) DefaultModel() string {
 // ClientOption allows configuring the client.
 type ClientOption func(*Client)
 
-// WithHTTPClient sets a custom HTTP client.
+// WithHTTPClient sets a custom HTTP client. A nil client is ignored.
 func WithHTTPClient(httpClient *http.Client) ClientOption {
 	return func(c *Client) {
-		c.httpClient = httpClient
+		if httpClient != nil {
+			c.httpClient = httpClient
+		}
 	}
 }
 
@@ -137,7 +151,8 @@ type RequestConfig struct {
 // RequestOption configures individual API requests.
 type RequestOption func(*RequestConfig)
 
-// WithRequestTimeout sets a timeout for an individual request.
+// WithRequestTimeout sets a timeout for each individual HTTP attempt. Use
+// RetryPolicy.Timeout to limit the whole call including retries.
 func WithRequestTimeout(d time.Duration) RequestOption {
 	return func(rc *RequestConfig) {
 		rc.Timeout = d
@@ -152,6 +167,16 @@ func WithRequestHeader(key, value string) RequestOption {
 		}
 		rc.ExtraHeaders[key] = value
 	}
+}
+
+// WithDangerZoneImages opts the request in to image assets and box questions.
+func WithDangerZoneImages() RequestOption {
+	return WithRequestHeader(HeaderDangerZoneImages, "true")
+}
+
+// WithDangerZoneLongContext opts the request in to the long-context limits.
+func WithDangerZoneLongContext() RequestOption {
+	return WithRequestHeader(HeaderDangerZoneLongContext, "true")
 }
 
 // WithRequestRetry sets a custom retry policy for an individual request.
@@ -202,10 +227,7 @@ func (c *Client) executeAttempt(ctx context.Context, method, url string, bodyByt
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
-			return 0, nil, &TimeoutError{Err: err}
-		}
-		return 0, nil, &ConnectionError{Err: err}
+		return 0, nil, transportError(reqCtx, err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -213,7 +235,7 @@ func (c *Client) executeAttempt(ctx context.Context, method, url string, bodyByt
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resp.StatusCode, resp.Header, &ConnectionError{Err: err}
+		return resp.StatusCode, resp.Header, transportError(reqCtx, err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -229,32 +251,56 @@ func (c *Client) executeAttempt(ctx context.Context, method, url string, bodyByt
 	return resp.StatusCode, resp.Header, nil
 }
 
-func (c *Client) doRequest(ctx context.Context, method, path string, body any, respObj any, opts *RequestConfig) error {
-	var bodyBytes []byte
-	if body != nil {
-		if opts != nil && len(opts.ExtraBody) > 0 {
-			b, err := json.Marshal(body)
-			if err != nil {
-				return fmt.Errorf("failed to marshal request body: %w", err)
-			}
-			var merged map[string]any
-			if err := json.Unmarshal(b, &merged); err != nil {
-				return fmt.Errorf("failed to unmarshal request body for merging: %w", err)
-			}
-			for k, v := range opts.ExtraBody {
-				merged[k] = v
-			}
-			bodyBytes, err = json.Marshal(merged)
-			if err != nil {
-				return fmt.Errorf("failed to marshal merged request body: %w", err)
-			}
-		} else {
-			var err error
-			bodyBytes, err = json.Marshal(body)
-			if err != nil {
-				return fmt.Errorf("failed to marshal request body: %w", err)
-			}
+// transportError classifies a failure to send a request or read its response
+// as a TimeoutError (context deadline or net-level timeout, such as
+// http.Client.Timeout) or a ConnectionError.
+func transportError(ctx context.Context, err error) error {
+	var ne net.Error
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+		return &TimeoutError{Err: err}
+	}
+	return &ConnectionError{Err: err}
+}
+
+// encodeBody marshals body and merges any ExtraBody fields into it. The merge
+// keeps the original fields as raw JSON so numbers are not re-encoded through float64.
+func encodeBody(body any, opts *RequestConfig) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+	if opts == nil || len(opts.ExtraBody) == 0 {
+		return b, nil
+	}
+
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(b, &merged); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal request body for merging: %w", err)
+	}
+	if merged == nil {
+		return nil, errors.New("request body must be a JSON object to merge extra body fields")
+	}
+	for k, v := range opts.ExtraBody {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal extra body field %q: %w", k, err)
 		}
+		merged[k] = raw
+	}
+	b, err = json.Marshal(merged)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal merged request body: %w", err)
+	}
+	return b, nil
+}
+
+func (c *Client) doRequest(ctx context.Context, method, path string, body any, respObj any, opts *RequestConfig) error {
+	bodyBytes, err := encodeBody(body, opts)
+	if err != nil {
+		return err
 	}
 
 	policy := c.retryPolicy
@@ -269,26 +315,32 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body any, r
 
 	url := c.baseURL + path
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		statusCode, header, err := c.executeAttempt(ctx, method, url, bodyBytes, respObj, opts)
+	// The policy's Timeout bounds the whole call: every attempt and every delay.
+	callCtx := ctx
+	if policy != nil && policy.Timeout > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, policy.Timeout)
+		defer cancel()
+	}
+
+	for attempt := 0; ; attempt++ {
+		statusCode, header, err := c.executeAttempt(callCtx, method, url, bodyBytes, respObj, opts)
 		if err == nil {
 			return nil
 		}
 
-		if attempt == maxAttempts-1 {
+		if attempt >= maxAttempts-1 || !shouldRetry(callCtx, err, statusCode, policy) {
 			return err
 		}
 
-		if !shouldRetry(ctx, err, statusCode, policy) {
+		if sleepErr := sleepBackoff(callCtx, attempt, policy, header); sleepErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// The call's time budget ran out while waiting: report the last failure.
 			return err
-		}
-
-		if sleepErr := sleepBackoff(ctx, attempt, policy, header); sleepErr != nil {
-			return sleepErr
 		}
 	}
-
-	return nil
 }
 
 func shouldRetry(ctx context.Context, err error, statusCode int, policy *RetryPolicy) bool {
@@ -326,26 +378,14 @@ func shouldRetryStatus(statusCode int, policy *RetryPolicy) bool {
 }
 
 func sleepBackoff(ctx context.Context, attempt int, policy *RetryPolicy, header http.Header) error {
-	delay := policy.BackoffInitial * math.Pow(2, float64(attempt))
-	if delay > policy.BackoffMax {
-		delay = policy.BackoffMax
+	wait := time.Duration(backoffDelay(attempt, policy, header) * float64(time.Second))
+
+	// Don't sleep through the rest of the deadline only to fail afterwards.
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < wait {
+		return context.DeadlineExceeded
 	}
 
-	if policy.RespectRetryAfter && header != nil {
-		if ra := header.Get("Retry-After"); ra != "" {
-			if sec, err := strconv.ParseFloat(ra, 64); err == nil && sec > 0 {
-				delay = sec
-			}
-		}
-	} else if policy.BackoffJitter > 0 {
-		jitter := (rand.Float64()*2 - 1) * policy.BackoffJitter * delay
-		delay += jitter
-		if delay < 0 {
-			delay = policy.BackoffInitial
-		}
-	}
-
-	timer := time.NewTimer(time.Duration(delay * float64(time.Second)))
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 
 	select {
@@ -354,6 +394,56 @@ func sleepBackoff(ctx context.Context, attempt int, policy *RetryPolicy, header 
 	case <-timer.C:
 		return nil
 	}
+}
+
+// backoffDelay returns the delay in seconds before the given retry attempt:
+// jittered exponential backoff, overridden by a valid Retry-After header when
+// the policy respects it.
+func backoffDelay(attempt int, policy *RetryPolicy, header http.Header) float64 {
+	if policy.RespectRetryAfter {
+		if sec, ok := retryAfterSeconds(header); ok {
+			return sec
+		}
+	}
+
+	delay := policy.BackoffInitial * math.Pow(2, float64(attempt))
+	if policy.BackoffJitter > 0 {
+		delay += (rand.Float64()*2 - 1) * policy.BackoffJitter * delay
+		if delay < 0 {
+			delay = policy.BackoffInitial
+		}
+	}
+	if policy.BackoffMax > 0 && delay > policy.BackoffMax {
+		// Jitter below the cap instead of clamping, so capped retries stay spread out.
+		delay = policy.BackoffMax * (1 - rand.Float64()*math.Min(policy.BackoffJitter, 1))
+	}
+	// Keep the delay representable as a time.Duration even when uncapped.
+	return math.Min(delay, maxDelaySeconds)
+}
+
+// retryAfterSeconds reads the retry-after-ms header, or else Retry-After given
+// either as seconds or as an HTTP date, capped at maxRetryAfter. It reports
+// false when neither header is present, parsable and in the future.
+func retryAfterSeconds(header http.Header) (float64, bool) {
+	if ms, err := strconv.ParseFloat(header.Get("Retry-After-Ms"), 64); err == nil && ms > 0 {
+		return math.Min(ms/1000, maxRetryAfter), true
+	}
+	ra := header.Get("Retry-After")
+	if ra == "" {
+		return 0, false
+	}
+	sec, err := strconv.ParseFloat(ra, 64)
+	if err != nil {
+		t, perr := http.ParseTime(ra)
+		if perr != nil {
+			return 0, false
+		}
+		sec = time.Until(t).Seconds()
+	}
+	if !(sec > 0) {
+		return 0, false
+	}
+	return math.Min(sec, maxRetryAfter), true
 }
 
 // NewSystemOne starts a fluent SystemOne request builder bound to this client.
@@ -372,24 +462,14 @@ func (c *Client) SystemOne(ctx context.Context, req *SystemOneRequest, opts ...R
 		return nil, ErrEmptyQuestions
 	}
 
-	model := req.Model
-	if model == "" {
-		model = c.defaultModel
+	reqBody := *req
+	if reqBody.Model == "" {
+		reqBody.Model = c.defaultModel
 	}
 
 	var rc RequestConfig
 	for _, opt := range opts {
 		opt(&rc)
-	}
-
-	reqBody := struct {
-		State     JSONContent         `json:"state"`
-		Model     string              `json:"model"`
-		Questions map[string]Question `json:"questions"`
-	}{
-		State:     req.State,
-		Model:     model,
-		Questions: req.Questions,
 	}
 
 	var res SystemOneResponse
