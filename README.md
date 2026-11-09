@@ -66,4 +66,34 @@ func main() {
 }
 ```
 
+## Images and box questions
+
+Box questions and image assets need Jev 1.14 and the `TypeSafe-Danger-Zone-Images` header:
+
+```go
+png, _ := os.ReadFile("screenshot.png")
+
+resp, err := client.NewSystemOne("Screenshot: [screen]").
+	Asset("[screen]", gojev.Image("png", png)).
+	Box("button", "Locate the submit button.").
+	DangerZoneImages().
+	Do(ctx)
+if err != nil {
+	log.Fatal(err)
+}
+if b := resp.Box("button"); b != nil {
+	fmt.Printf("top=%.2f left=%.2f\n", b.Box.Top, b.Box.Left)
+}
+```
+
+## Retries and timeouts
+
+By default the client retries 408, 429 and every 5xx (including 529, "overloaded") up to 2 times with jittered exponential backoff, honoring `retry-after-ms` and `Retry-After`. The whole call, including retries and delays, is limited to 2 minutes, while each HTTP attempt times out after 30 seconds; change the budget with `RetryPolicy.Timeout`:
+
+```go
+policy := gojev.DefaultRetryPolicy()
+policy.Timeout = 5 * time.Minute
+client, err := gojev.NewClient(apiKey, gojev.WithRetryPolicy(policy))
+```
+
 Learn what TypeSafe is, what it can do, and how to use it in [TypeSafe docs](https://docs.typesafe.ai/).

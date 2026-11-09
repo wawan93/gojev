@@ -2,9 +2,12 @@ package gojev_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -146,5 +149,131 @@ func TestErrorUnwrappingAndExtraction(t *testing.T) {
 
 	if apiErr.Message != "invalid_request" {
 		t.Errorf("expected message 'invalid_request', got %q", apiErr.Message)
+	}
+}
+
+func TestHTTPClientTimeoutIsTimeoutError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Second):
+		}
+	}))
+	defer ts.Close()
+
+	client, err := gojev.NewClient("test-key",
+		gojev.WithBaseURL(ts.URL),
+		gojev.WithHTTPClient(&http.Client{Timeout: 20 * time.Millisecond}),
+		gojev.WithRetryPolicy(nil),
+	)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	_, err = client.Models.List(context.Background())
+	var te *gojev.TimeoutError
+	if !errors.As(err, &te) {
+		t.Fatalf("expected *TimeoutError, got %T: %v", err, err)
+	}
+}
+
+func TestWithHTTPClientNilIsIgnored(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"models": []}`))
+	}))
+	defer ts.Close()
+
+	client, err := gojev.NewClient("test-key", gojev.WithBaseURL(ts.URL), gojev.WithHTTPClient(nil))
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	if _, err := client.Models.List(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExtraBodyPreservesLargeIntegers(t *testing.T) {
+	var got string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = string(b)
+		_, _ = w.Write([]byte(`{"answers": {}}`))
+	}))
+	defer ts.Close()
+
+	client, err := gojev.NewClient("test-key", gojev.WithBaseURL(ts.URL))
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	_, err = client.NewSystemOne(map[string]any{"order_id": int64(9007199254740993)}).
+		Noul("q", "?").
+		ExtraBody("custom", true).
+		Do(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got, "9007199254740993") || !strings.Contains(got, `"custom":true`) {
+		t.Errorf("request body lost precision or extra field: %s", got)
+	}
+}
+
+func TestAnswerJSONRoundTrip(t *testing.T) {
+	in := []byte(`{"model":"m","answers":{"a":{"type":"noul","noul":0.9},"b":{"type":"choice","choice":"x","confidence":0.8,"probabilities":{"x":0.8}}},"usage":{"input_tokens":1,"output_tokens":2}}`)
+	var r1 gojev.SystemOneResponse
+	if err := json.Unmarshal(in, &r1); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	out, err := json.Marshal(r1)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var r2 gojev.SystemOneResponse
+	if err := json.Unmarshal(out, &r2); err != nil {
+		t.Fatalf("re-unmarshal %s: %v", out, err)
+	}
+	if n := r2.Noul("a"); n == nil || n.Noul != 0.9 {
+		t.Errorf("noul lost in round trip: %s", out)
+	}
+	if c := r2.Choice("b"); c == nil || c.Choice != "x" {
+		t.Errorf("choice lost in round trip: %s", out)
+	}
+
+	// The type field comes from the answer kind, not the inner struct.
+	built, err := json.Marshal(gojev.Answer{Noul: &gojev.NoulAnswer{Noul: 0.5}})
+	if err != nil || !strings.Contains(string(built), `"type":"noul"`) {
+		t.Errorf("expected type noul in %s (err %v)", built, err)
+	}
+
+	// Unknown answer types survive a round trip.
+	unknown := `{"type":"rank","order":["a","b"]}`
+	var ua gojev.Answer
+	if err := json.Unmarshal([]byte(unknown), &ua); err != nil {
+		t.Fatalf("unmarshal unknown: %v", err)
+	}
+	if out, _ := json.Marshal(ua); string(out) != unknown {
+		t.Errorf("unknown answer not preserved: %s", out)
+	}
+
+	// Reusing an Answer must not leave stale pointers from the previous decode.
+	var a gojev.Answer
+	_ = json.Unmarshal([]byte(`{"type":"noul","noul":1}`), &a)
+	_ = json.Unmarshal([]byte(`{"type":"choice","choice":"x"}`), &a)
+	if a.Noul != nil {
+		t.Errorf("stale Noul pointer after decoding a choice answer")
+	}
+}
+
+func TestQuestionLiteralsMarshalType(t *testing.T) {
+	cases := map[string]gojev.Question{
+		`"type":"noul"`:   gojev.NoulQuestion{Instructions: "?"},
+		`"type":"choice"`: gojev.ChoiceQuestion{Instructions: "?"},
+		`"type":"score"`:  gojev.ScoreQuestion{Instructions: "?"},
+	}
+	for want, q := range cases {
+		b, err := json.Marshal(q)
+		if err != nil || !strings.Contains(string(b), want) {
+			t.Errorf("expected %s in %s (err %v)", want, b, err)
+		}
 	}
 }
